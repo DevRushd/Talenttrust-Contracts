@@ -49,6 +49,8 @@ Read-only queries:
 - `get_protocol_fee_bps() -> u32`
 - `get_accumulated_protocol_fees() -> i128`
 - `get_bounds() -> ContractBounds` *(returns the compile-time protocol bounds: max milestones, max single milestone amount, max total escrow amount, max fee bps; see [`ContractBounds`](../../contracts/escrow/src/types.rs))*
+- `get_milestone_progress(contract_id) -> MilestoneProgress` — returns a struct carrying `completed` and `total` milestone counts; returns `completed: 0, total: 0` for an unknown id instead of panicking, unlike other getters below
+
 
 ### Read-only getter semantics
 
@@ -93,6 +95,11 @@ Per-getter details:
   when the contract id is unknown. Does not extend persistent TTL because
   approvals live in temporary storage bounded by
   `PENDING_APPROVAL_TTL_LEDGERS`.
+- `get_milestone_progress(contract_id)` returns the completed and total milestone
+  counts. It does not panic on an unknown contract id; it returns `completed: 0`
+  and `total: 0` instead. On a valid contract, it extends the contract's and
+  milestones' TTL.
+
 
 These properties are locked in by tests under
 `contracts/escrow/src/test/persistence.rs` (issue #475).
@@ -111,7 +118,8 @@ but serve different purposes and must not be conflated:
 milestones vector. Its `schema_version` tracks the limits ABI only.
 `ContractSummary` is the per-contract snapshot used by `get_contract_summary`
 and embedded in `FinalizationRecord`; its schema version tracks per-contract
-data.
+data. Note that `reputation_issued` in `ContractSummary` tracks whether a rating
+was given for the contract by reading the storage-backed `DataKey::ReputationIssued`.
 
 Indexers discovering limits should call `get_bounds()`. Indexers snapshotting
 contract state should call `get_contract_summary()`.
@@ -124,13 +132,22 @@ Operational controls:
 - `activate_emergency_pause() -> bool`
 - `resolve_emergency() -> bool`
 
-Governance admin transfer (two-step):
+Admin transfer (two-step, timelocked):
 
-- `propose_governance_admin(proposed) -> bool`
-- `accept_governance_admin() -> bool`
-- `cancel_governance_admin_proposal() -> bool`
-- `get_governance_admin() -> Option<Address>`
-- `get_pending_governance_admin() -> Option<Address>`
+- `propose_admin(proposed) -> bool`
+- `accept_admin() -> bool`
+- `cancel_admin() -> bool`
+- `get_admin() -> Option<Address>`
+- `get_pending_admin() -> Option<Address>`
+- `get_pending_admin_proposed_at() -> Option<u32>`
+
+Client migration (two-step, TTL-gated):
+
+- `propose_client_migration(contract_id, current_client, new_client) -> bool`
+- `accept_client_migration(contract_id, new_client) -> bool`
+- `cancel_client_migration(contract_id, current_client) -> bool`
+- `has_pending_client_migration(contract_id) -> bool`
+- `get_pending_client_migration(contract_id) -> PendingClientMigration`
 
 ## Canonical Happy Path
 
@@ -397,27 +414,37 @@ days** at ~5s/ledger. The record's `expires_at_ledger` is set to
 Security assumption: an expired proposal cannot transfer client rights. Once the
 TTL lapses the stale proposal is unrecoverable; the current client must submit a
 fresh `propose_client_migration` call to start a new window.
-## Two-Step Governance Admin Transfer
+## Two-Step Admin Transfer
 
-The admin transfer uses a propose-accept (two-step) pattern:
+The admin transfer uses a propose-accept (two-step) pattern with a timelock and
+an expiry window, so a typo'd address or a compromised admin key can't hand
+over the contract irrevocably in a single call:
 
 ```rust
 // Step 1: current admin proposes next admin
-escrow.propose_governance_admin(&next_admin);
+escrow.propose_admin(&next_admin);
 
-// Step 2: next admin accepts (requires next_admin.require_auth())
-escrow.accept_governance_admin();
+// Step 2 (after ADMIN_ROTATION_MIN_DELAY_LEDGERS, ~2 days): next admin
+// accepts (requires next_admin.require_auth())
+escrow.accept_admin();
 ```
 
 ### Rules
 - **Self-proposal is rejected**: proposing the current admin as the new admin
   panics with `CannotProposeSelf`.
-- **Re-proposing overwrites**: calling `propose_governance_admin` while a
-  pending proposal exists silently replaces it (no explicit cancellation
-  required).
-- **Cancellation**: `cancel_governance_admin_proposal` is admin-gated (only
-  the current admin may cancel). It clears the pending admin and emits a
-  `("admin", "cancelled")` event.
+- **Re-proposing overwrites**: calling `propose_admin` while a pending
+  proposal exists silently replaces it (no explicit cancellation required).
+- **Timelock**: `accept_admin` panics with `TimelockNotElapsed` if called
+  before `ADMIN_ROTATION_MIN_DELAY_LEDGERS` (~2 days) have elapsed since the
+  proposal.
+- **Expiry**: `accept_admin` panics with `AdminProposalExpired` if called
+  after `ADMIN_ROTATION_PROPOSAL_TTL_LEDGERS` (~9 days) have elapsed since the
+  proposal. Because a panic rolls back all state, the stale proposal is left
+  in place — `cancel_admin` or a fresh `propose_admin` is required to move
+  past it.
+- **Cancellation**: `cancel_admin` is admin-gated (only the current admin may
+  cancel), and works on an expired proposal too. It clears the pending admin
+  and emits a `("admin", "cancelled")` event.
 - **No stale acceptance**: accepting after cancellation panics with
   `InvalidState` because the pending proposal has been removed.
 - All operations require the contract to be initialized.
@@ -425,9 +452,9 @@ escrow.accept_governance_admin();
 ### Events
 | Topic | Data | Trigger |
 |---|---|---|
-| `("admin", "proposed")` | `(admin, proposed, timestamp)` | `propose_governance_admin` |
-| `("admin", "accepted")` | `(old_admin, new_admin, timestamp)` | `accept_governance_admin` |
-| `("admin", "cancelled")` | `(admin, cancelled_proposal, timestamp)` | `cancel_governance_admin_proposal` |
+| `("admin", "proposed")` | `(admin, proposed, timestamp)` | `propose_admin` |
+| `("admin", "accepted")` | `(old_admin, new_admin, timestamp)` | `accept_admin` |
+| `("admin", "cancelled")` | `(admin, cancelled_proposal, timestamp)` | `cancel_admin` |
 
 ## Pause and Emergency Controls
 
@@ -602,7 +629,139 @@ treated as roadmap text, not live integration guidance.
 
 Participants can approve milestone items prior to fund distribution payouts. If an authorization mistake is discovered prior to complete disbursement release configurations, the approving party can rescind authority.
 
-#### `revoke_approval(contract_id: Address, caller: Address, milestone_index: u32)`
+#### `revoke_milestone_approval(contract_id: u32, caller: Address, milestone_index: u32) -> bool`
 - **Authorization Required:** `caller.require_auth()`
-- **Behavior:** Explicitly removes individual state flags (`client_approved` | `freelancer_approved` | `arbiter_approved`). When all structural components drop to `false`, temporary records are scrubbed entirely to maximize gas savings.
-- **Errors raised:** `Error::MilestoneAlreadyReleased`, `Error::ApprovalRecordNotFound`.
+- **Behavior:** Explicitly removes the caller's own approval flag (`client_approved` | `freelancer_approved` | `arbiter_approved`). Other parties' flags are left intact. When all three flags become `false`, the temporary record is removed entirely to maximize gas savings.
+- **Errors raised:** `Error::ContractNotFound`, `Error::IndexOutOfBounds`, `Error::MilestoneAlreadyReleased`, `Error::UnauthorizedRole`, `Error::InsufficientApprovals` (when no approval record exists or the caller has not approved).
+
+
+---
+
+## Platform Fee (issue #1682)
+
+> **Implemented in:** `contracts/escrow/src/lib.rs`
+
+### Overview
+
+The protocol now supports a capped platform fee charged on each milestone
+release, with the rate **snapshotted per escrow at creation time**. This
+guarantees that a client and freelancer who agree on a rate at contract
+creation are never exposed to an admin raising that rate later.
+
+### New Contract Interface
+
+#### `set_fee(fee_bps: u32, treasury: Address) → Result<(), EscrowError>`
+
+Admin-only. Sets the global fee rate (in basis points) and the treasury
+address atomically. Both values are updated in the same call so it is never
+possible for a non-zero fee to exist without a valid treasury.
+
+- `fee_bps` must be `<= MAX_FEE_BPS` (500, i.e. 5 %). Exceeding this limit
+  returns `EscrowError::FeeTooHigh`.
+- Non-admin callers are rejected by `require_auth`.
+- Emits event: `("fee_set",) → (fee_bps, treasury)`.
+
+#### `get_fee_config(env) → (u32, Option<Address>)`
+
+Returns `(fee_bps, Some(treasury))` when a fee is configured, or `(0, None)`
+when no fee has been set (the default).
+
+#### `get_escrow_fee(env, id: u64) → u32`
+
+Returns the fee snapshot (in bps) stored when escrow `id` was created.
+Returns `0` for escrows created before `set_fee` was ever called (backward
+compatible).
+
+### Updated Functions
+
+#### `release_milestone`
+
+Fee is now deducted from each milestone payout:
+
+```
+fee        = m.amount * escrow_fee_bps / 10_000   (integer division, rounds down)
+freelancer = m.amount - fee
+treasury   = fee
+```
+
+The event payload changes from `(index, m.amount)` to `(index, m.amount, fee)`.
+
+If `fee == 0` (default or integer round-down to zero), the treasury transfer
+is skipped and behaviour is identical to the pre-fee implementation.
+
+#### `resolve_dispute`
+
+The platform fee is applied **only to the freelancer's gross share**:
+
+```
+gross_freelancer = held * freelancer_bps / 10_000
+fee              = gross_freelancer * escrow_fee_bps / 10_000
+to_freelancer    = gross_freelancer - fee
+to_client        = held - gross_freelancer          ← no fee
+```
+
+The event payload changes from `(to_freelancer, to_client)` to
+`(to_freelancer, to_client, fee)`.
+
+#### `cancel_contract`
+
+**No fee is charged.** The client's refund is always the full unreleased
+balance. This is unchanged behaviour.
+
+### New Error Variant
+
+| Code | Variant | Trigger |
+|------|---------|---------|
+| 20 | `FeeTooHigh` | `set_fee` called with `fee_bps > MAX_FEE_BPS` (500) |
+
+Error codes are append-only. Codes 1–19 are unchanged.
+
+### New Events
+
+| Topic | Data | Emitter |
+|-------|------|---------|
+| `("fee_set",)` | `(fee_bps, treasury)` | `set_fee` |
+
+### Existing Events — Changed Payloads
+
+| Topic | Old Payload | New Payload |
+|-------|-------------|-------------|
+| `("release", id)` | `(index, m.amount)` | `(index, m.amount, fee)` |
+| `("resolved", id)` | `(to_freelancer, to_client)` | `(to_freelancer, to_client, fee)` |
+
+### Constants
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `MAX_FEE_BPS` | `500` | Hard cap on fee rate (5 %). |
+| `BPS_DENOMINATOR` | `10_000` | Denominator for all basis-point math. |
+
+### Security Properties
+
+| Question | Answer |
+|----------|--------|
+| Can the admin change the fee of an already-created escrow? | **No.** The fee is snapshotted into `DataKey::EscrowFee(id)` at `create_contract` time. Subsequent `set_fee` calls do not touch existing snapshots. |
+| Can the fee exceed `MAX_FEE_BPS` or the release amount? | **No.** `set_fee` enforces `fee_bps <= MAX_FEE_BPS`. The fee is computed as `m.amount * fee_bps / 10_000`; since `fee_bps <= 500 < 10_000`, the fee is always strictly less than `m.amount`. |
+| What happens if no treasury is set but fee > 0? | **Impossible by construction.** `set_fee` requires both `fee_bps` and `treasury` and updates them atomically. A non-zero fee snapshot can only exist if `set_fee` was called, which always sets a treasury at the same time. |
+
+### Balance Conservation Invariant
+
+For every `release_milestone` call:
+
+```
+freelancer_received + treasury_received == m.amount
+```
+
+For every `resolve_dispute` call:
+
+```
+to_freelancer + fee + to_client == held
+```
+
+For every `cancel_contract` call:
+
+```
+client_refund == held   (fee == 0)
+```
+
+These are asserted by the fee tests in `contracts/escrow/src/test.rs`.

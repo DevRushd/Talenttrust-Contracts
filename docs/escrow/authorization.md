@@ -1,345 +1,206 @@
-# Release Authorization and Approval Lifecycle
-
-This document provides an authoritative guide to the escrow contract's release authorization modes and the approval-then-release flow. It defines who may approve milestones, who may trigger releases, how many approvals each mode requires, and how TTL-based approval expiry interacts with release operations.
-
-## Overview
-
-The escrow contract supports four `ReleaseAuthorization` modes that control who can approve milestone releases and who can execute the release transaction. These modes are defined in `contracts/escrow/src/types.rs` and enforced across `contracts/escrow/src/approvals.rs` and `release_milestone` in `contracts/escrow/src/lib.rs`.
-
-## ReleaseAuthorization Modes
-
-The four authorization modes are:
-
-| Mode | Enum Value | Description |
-|------|------------|-------------|
-| `ClientOnly` | 0 | Only the client can approve and release |
-| `ClientAndArbiter` | 1 | Either the client or arbiter can approve and release |
-| `ArbiterOnly` | 2 | Only the arbiter can approve and release |
-| `MultiSig` | 3 | Both client and freelancer must approve; either can release |
-
-## Authorization Matrix
-
-Per-mode authorization rules for approval and release operations:
-
-### ClientOnly Mode
-
-| Aspect | Rule |
-|--------|------|
-| **Allowed Approvers** | Client only |
-| **Required Approvals** | Client approval (1 signature) |
-| **Allowed Release Callers** | Client only |
-| **Approval Check Logic** | `approvals.client_approved` must be `true` |
-| **Failure Error Codes** | `UnauthorizedRole` (if non-client attempts), `AlreadyApproved` (duplicate), `InsufficientApprovals` (missing) |
-
-### ArbiterOnly Mode
-
-| Aspect | Rule |
-|--------|------|
-| **Allowed Approvers** | Arbiter only |
-| **Required Approvals** | Arbiter approval (1 signature) |
-| **Allowed Release Callers** | Arbiter only |
-| **Approval Check Logic** | `approvals.arbiter_approved` must be `true` |
-| **Failure Error Codes** | `UnauthorizedRole` (if non-arbiter attempts), `AlreadyApproved` (duplicate), `InsufficientApprovals` (missing) |
-| **Contract Creation Requirement** | Arbiter must be provided (enforced by `MissingArbiter` error) |
-
-### ClientAndArbiter Mode
-
-| Aspect | Rule |
-|--------|------|
-| **Allowed Approvers** | Client OR Arbiter |
-| **Required Approvals** | Either client OR arbiter approval (1 signature, OR logic) |
-| **Allowed Release Callers** | Client OR Arbiter |
-| **Approval Check Logic** | `approvals.client_approved || approvals.arbiter_approved` must be `true` |
-| **Failure Error Codes** | `UnauthorizedRole` (if freelancer attempts), `AlreadyApproved` (duplicate from same party), `InsufficientApprovals` (neither approved) |
-| **Contract Creation Requirement** | Arbiter must be provided (enforced by `MissingArbiter` error) |
-
-### MultiSig Mode
-
-| Aspect | Rule |
-|--------|------|
-| **Allowed Approvers** | Client AND Freelancer |
-| **Required Approvals** | Both client AND freelancer approval (2 signatures, AND logic) |
-| **Allowed Release Callers** | Client OR Freelancer (either can trigger release after both approve) |
-| **Approval Check Logic** | `approvals.client_approved && approvals.freelancer_approved` must be `true` |
-| **Failure Error Codes** | `UnauthorizedRole` (if arbiter attempts), `AlreadyApproved` (duplicate from same party), `InsufficientApprovals` (one or both missing) |
-| **Contract Creation Requirement** | Arbiter optional (not required) |
-
-**Note on MultiSig Inconsistency**: The MultiSig mode requires both client and freelancer to approve, but allows either party to trigger the release. This differs from the typical multi-signature pattern where approval and release are the same operation. The current implementation separates approval (recording intent) from release (executing the transfer), which enables the release caller to be different from the approvers.
-
-## Approval Lifecycle
-
-The approval-then-release flow follows this sequence:
-
-### 1. Approve Milestone (`approve_milestone_release`)
-
-**Entry Point**: `contracts/escrow/src/lib.rs::approve_milestone_release` → `contracts/escrow/src/approvals.rs::approve_milestone`
-
-**Purpose**: Records a party's approval for a specific milestone release.
-
-**Prerequisites**:
-- Contract must exist and be in `Funded` state
-- Milestone index must be valid
-- Milestone must not already be released
-- Caller must be authenticated via `require_auth()`
-- Caller must be authorized based on the `ReleaseAuthorization` mode
-
-**Storage**: Approvals are stored in temporary storage under `DataKey::MilestoneApprovals(contract_id, milestone_index)` with the following structure:
-```rust
-pub struct MilestoneApprovals {
-    pub client_approved: bool,
-    pub freelancer_approved: bool,
-    pub arbiter_approved: bool,
-}
-```
-
-**TTL Configuration**:
-- Initial TTL: `PENDING_APPROVAL_TTL_LEDGERS` = 120,960 ledgers (~7 days at ~5s per ledger)
-- Bump threshold: `PENDING_APPROVAL_BUMP_THRESHOLD` = 17,280 ledgers (~1 day)
-- TTL is extended to the full `PENDING_APPROVAL_TTL_LEDGERS` whenever the entry is accessed above the bump threshold
-
-**Error Codes**:
-- `ContractNotFound`: Contract does not exist
-- `InvalidState`: Contract not in `Funded` state
-- `IndexOutOfBounds`: Milestone index invalid
-- `MilestoneAlreadyReleased`: Milestone already released
-- `UnauthorizedRole`: Caller not authorized to approve for this mode
-- `AlreadyApproved`: Caller already approved this milestone
-
-**Security Properties**:
-- Caller authentication enforced via `require_auth()`
-- Duplicate approvals from the same party are rejected
-- Approvals auto-expire after TTL elapses (Soroban temporary storage eviction)
-- Fail-closed: missing or expired approvals prevent release
-
-### 2. Check Approvals (`check_approvals`)
-
-**Entry Point**: `contracts/escrow/src/approvals.rs::check_approvals`
-
-**Purpose**: Validates that sufficient approvals exist for a milestone release.
-
-**Behavior**:
-- Loads approvals from temporary storage
-- Returns `None` if approvals don't exist or have expired (TTL elapsed)
-- Checks approval sufficiency based on `ReleaseAuthorization` mode
-
-**Approval Sufficiency Logic**:
-```rust
-match contract.release_authorization {
-    ReleaseAuthorization::ClientOnly => approvals.client_approved,
-    ReleaseAuthorization::ArbiterOnly => approvals.arbiter_approved,
-    ReleaseAuthorization::ClientAndArbiter => {
-        approvals.client_approved || approvals.arbiter_approved
-    }
-    ReleaseAuthorization::MultiSig => {
-        approvals.client_approved && approvals.freelancer_approved
-    }
-}
-```
-
-**Error Codes**:
-- `InsufficientApprovals`: Approvals missing, insufficient, or expired
-
-**Security Properties**:
-- Fail-closed: expired approvals are treated as absent
-- TTL expiry is enforced by Soroban's temporary storage (automatic eviction)
-
-### 3. Release Milestone (`release_milestone`)
-
-**Entry Point**: `contracts/escrow/src/lib.rs::release_milestone`
-
-**Purpose**: Executes the fund transfer to the freelancer for a specific milestone.
-
-**Prerequisites**:
-- Contract must exist and be in `Funded` state
-- Caller must be authenticated via `require_auth()`
-- Caller must be authorized to release based on the `ReleaseAuthorization` mode
-- Valid, non-expired approvals must exist (checked via `check_approvals`)
-- Milestone must not already be released or refunded
-- Sufficient funds must be available
-
-**Release Authorization Check**:
-```rust
-match contract.release_authorization {
-    ReleaseAuthorization::ClientOnly => {
-        if !is_client { return Err(Error::UnauthorizedRole); }
-    }
-    ReleaseAuthorization::ArbiterOnly => {
-        if !is_arbiter { return Err(Error::UnauthorizedRole); }
-    }
-    ReleaseAuthorization::ClientAndArbiter => {
-        if !is_client && !is_arbiter { return Err(Error::UnauthorizedRole); }
-    }
-    ReleaseAuthorization::MultiSig => {
-        if !is_client && !is_freelancer { return Err(Error::UnauthorizedRole); }
-    }
-}
-```
-
-**Error Codes**:
-- `ContractNotFound`: Contract does not exist
-- `InvalidState`: Contract not in `Funded` state
-- `IndexOutOfBounds`: Milestone index invalid
-- `MilestoneAlreadyReleased`: Milestone already released
-- `AlreadyRefunded`: Milestone already refunded
-- `InsufficientFunds`: Insufficient contract balance
-- `InsufficientApprovals`: Required approvals missing or expired
-- `UnauthorizedRole`: Caller not authorized to release for this mode
-
-**Side Effects**:
-- Transfers milestone amount to freelancer
-- Marks milestone as released
-- Updates contract `released_amount`
-- Accumulates protocol fees if configured
-- Transitions contract to `Completed` if all milestones released/refunded
-- Clears approval records (see below)
-
-### 4. Clear Approvals (`clear_approvals`)
-
-**Entry Point**: `contracts/escrow/src/approvals.rs::clear_approvals`
-
-**Purpose**: Removes approval records after successful release to prevent reuse.
-
-**Behavior**:
-- Removes the `MilestoneApprovals` entry from temporary storage
-- Called automatically after successful `release_milestone`
-
-**Security Properties**:
-- Prevents approval reuse across multiple releases
-- Cleans up temporary storage
-- Idempotent: safe to call multiple times
-
-## TTL Expiry Behavior
-
-### Pending Approval TTL
-
-Pending approvals are stored in Soroban's temporary storage with a time-to-live (TTL) policy defined in `contracts/escrow/src/ttl.rs`:
-
-**Constants**:
-```rust
-pub const LEDGERS_PER_DAY: u32 = 17_280;
-pub const PENDING_APPROVAL_TTL_LEDGERS: u32 = LEDGERS_PER_DAY * 7;  // ~7 days
-pub const PENDING_APPROVAL_BUMP_THRESHOLD: u32 = LEDGERS_PER_DAY;   // ~1 day
-```
-
-**Expiry Window**: 120,960 ledgers (~7 days at ~5s per ledger on mainnet)
-
-**TTL Extension Logic**:
-- When an approval is recorded, TTL is set to `PENDING_APPROVAL_TTL_LEDGERS`
-- When the approval entry is accessed above the bump threshold, TTL is extended back to the full `PENDING_APPROVAL_TTL_LEDGERS`
-- If the entry is not accessed before TTL elapses, Soroban auto-evicts it
-
-**Interaction with Release**:
-- Expired approvals are indistinguishable from never-set approvals (both return `None`)
-- `check_approvals` treats expired approvals as insufficient and returns `InsufficientApprovals`
-- This provides a fail-closed security property: expired approvals cannot be used to release funds
-
-**Recovery from Expiry**:
-- If approvals expire, all parties must re-approve the milestone
-- This prevents stale approvals from being used long after they were granted
-- Integrators should monitor approval TTL and re-approve before expiry if needed
-
-## Complete Flow Example
-
-### ClientOnly Mode Flow
-
-1. **Client calls** `approve_milestone_release(contract_id, client_address, milestone_index)`
-   - Approval recorded: `client_approved = true`
-   - TTL set to 7 days
-
-2. **Client calls** `release_milestone(contract_id, client_address, milestone_index)`
-   - Caller authorization check: client is authorized ✓
-   - Approval check: `client_approved = true` ✓
-   - Funds transferred to freelancer
-   - Approval cleared
-
-### MultiSig Mode Flow
-
-1. **Client calls** `approve_milestone_release(contract_id, client_address, milestone_index)`
-   - Approval recorded: `client_approved = true`
-   - TTL set to 7 days
-   - Approval check fails: `client_approved && freelancer_approved = false` → `InsufficientApprovals`
-
-2. **Freelancer calls** `approve_milestone_release(contract_id, freelancer_address, milestone_index)`
-   - Approval recorded: `freelancer_approved = true`
-   - TTL extended to 7 days
-   - Approval check passes: `client_approved && freelancer_approved = true` ✓
-
-3. **Either client or freelancer calls** `release_milestone(contract_id, caller_address, milestone_index)`
-   - Caller authorization check: client or freelancer is authorized ✓
-   - Approval check: both approved ✓
-   - Funds transferred to freelancer
-   - Approval cleared
-
-## Error Code Reference
-
-| Error Code | Value | When Raised |
-|------------|-------|-------------|
-| `UnauthorizedRole` | 10, 11 | Caller not authorized for approval or release in current mode |
-| `AlreadyApproved` | 18 | Caller already approved this milestone (duplicate approval) |
-| `InsufficientApprovals` | 19, 20 | Required approvals missing, insufficient, or expired |
-| `MissingArbiter` | 2 | Arbiter required but not provided (ArbiterOnly or ClientAndArbiter modes) |
-| `InvalidArbiter` | 3 | Arbiter is same as client or freelancer |
-| `ContractNotFound` | 9 | Contract does not exist |
-| `InvalidState` | 11, 16 | Contract not in `Funded` state |
-| `IndexOutOfBounds` | 3, 12 | Milestone index invalid |
-| `MilestoneAlreadyReleased` | 13, 17 | Milestone already released |
-
-## Security Considerations
-
-### Fail-Closed Design
-
-- Missing approvals prevent release (`InsufficientApprovals`)
-- Expired approvals prevent release (treated as missing)
-- Unauthorized callers are rejected (`UnauthorizedRole`)
-- Duplicate approvals are rejected (`AlreadyApproved`)
-
-### Authentication
-
-- All approval and release operations require `require_auth()`
-- Soroban's native authentication ensures the caller is who they claim to be
-
-### Approval Isolation
-
-- Approvals are stored per-milestone, not per-contract
-- Clearing approvals after release prevents reuse
-- TTL expiry prevents stale approvals from being used
-
-### Mode-Specific Guarantees
-
-- **ClientOnly**: Only client can approve/release, ensuring client control
-- **ArbiterOnly**: Only arbiter can approve/release, enabling dispute resolution
-- **ClientAndArbiter**: Either can approve/release, providing flexibility
-- **MultiSig**: Both must approve, ensuring mutual agreement before release
-
-## Implementation References
-
-- **Type definitions**: `contracts/escrow/src/types.rs` (ReleaseAuthorization enum, MilestoneApprovals struct)
-- **Approval logic**: `contracts/escrow/src/approvals.rs` (approve_milestone, check_approvals, clear_approvals)
-- **Release logic**: `contracts/escrow/src/lib.rs` (release_milestone, approve_milestone_release)
-- **TTL configuration**: `contracts/escrow/src/ttl.rs` (PENDING_APPROVAL_TTL_LEDGERS, PENDING_APPROVAL_BUMP_THRESHOLD)
-
-## Testing Coverage
-
-The authorization modes are tested in:
-- `contracts/escrow/src/approvals.rs` (unit tests for approval logic)
-- `contracts/escrow/src/test/flows.rs` (integration tests for complete flows)
-- `contracts/escrow/src/test/security.rs` (security-focused tests for authorization)
-
-Test coverage ensures:
-- Each mode enforces the correct approver set
-- Each mode enforces the correct release caller set
-- TTL expiry prevents release with expired approvals
-- Duplicate approvals are rejected
-- Unauthorized callers are rejected
-- Approval clearing works correctly
-
-## NatSpec Cross-References
-
-The following NatSpec comments in the source code provide additional context:
-
-- `/// Defines who can approve milestone releases.` in `types.rs` (ReleaseAuthorization enum)
-- `/// Approves a milestone for release by the caller.` in `approvals.rs` (approve_milestone)
-- `/// Checks if a milestone has sufficient approvals for release.` in `approvals.rs` (check_approvals)
-- `/// Clears approval records for a milestone after successful release.` in `approvals.rs` (clear_approvals)
-- `/// Approves a milestone for release.` in `lib.rs` (approve_milestone_release)
-- `/// Releases a specific milestone, transferring funds to the freelancer.` in `lib.rs` (release_milestone)
+# Escrow Authorization Matrix
+
+This document is the security reference for authorization in the TalentTrust escrow contract. It covers every state-changing entrypoint exposed by the `#[contractimpl]` block in `contracts/escrow/src/lib.rs`, together with the signer checked by `require_auth()`, the authorization role, the pause category, and per-escrow freeze behavior. Read-only entrypoints are intentionally omitted.
+
+**Source of truth:** `contracts/escrow/src/lib.rs` for implementation and `contracts/escrow/src/test.rs` for MockAuth and gate tests. If this document and the implementation disagree, the implementation wins.
+
+---
+
+## 1. Authority model
+
+The contract recognizes the following authority categories. The **Role** column in the matrix uses these names.
+
+| Category | Source of authority | Notes |
+|----------|--------------------|-------|
+| `Admin` | `DataKey::Admin`, written once by `initialize` | Stored admin authorizes protocol administration. The admin implicitly holds both `Pauser` and `Resolver` via `holds_role`, so an explicit role grant is not required. |
+| `Pending admin` | `DataKey::PendingAdmin` | A nominee proposed by the current admin. Only the nominee may call `accept_admin`; no timelock is enforced by the contract. |
+| `Pauser` | Admin or `DataKey::RoleMember(Role::Pauser, account)` | Granted or revoked by `grant_role` / `revoke_role`. May operate the circuit breaker only. |
+| `Resolver` | Admin or `DataKey::RoleMember(Role::Resolver, account)` | May call `resolve_dispute`, but never when the resolver is a party to that escrow. For high-value escrows, the panel path is mandatory. |
+| `Panel member` | Current `Panel.members` set by `set_panel` | May vote on high-value disputes. A party to the escrow may not vote, and only votes from current members are tallied. |
+| `Party` | `EscrowContract.client` or `EscrowContract.freelancer` | Per-escrow authority. Identity is read from stored escrow state, not from an arbitrary caller argument, except where the entrypoint explicitly takes and validates a party address. |
+| `Anyone` | No signature required | Permissionless maintenance, expiry, or public governance actions. State changes are constrained by status, time, and storage predicates rather than by a signer. |
+
+A "funder" is an address named by the caller of `deposit_from`. The funder must authorize the deposit; the caller otherwise has no authority. An "acceptor" or "proposer" in a mutual action must be one of the two stored parties and must authorize the call.
+
+---
+
+## 2. Pause and freeze semantics
+
+### 2.1 Pause categories
+
+`contracts/escrow/src/lib.rs` defines six pause bits:
+
+| Constant | Value | Gates |
+|----------|------:|-------|
+| `PAUSE_CREATE` | 1 | Creation, setup, and scope changes |
+| `PAUSE_DEPOSIT` | 2 | Funding inflows |
+| `PAUSE_RELEASE` | 4 | Submission, claims, payouts, bonuses, delivery metadata |
+| `PAUSE_DISPUTE` | 8 | Opening disputes |
+| `PAUSE_CANCEL` | 16 | Cancellation, resignation, expiry, and mutual settlement |
+| `PAUSE_REPUTATION` | 32 | Ratings and rating voiding |
+| `PAUSE_ALL` | 63 | All six categories |
+
+`require_not_paused(op)` fails with `Paused` when `pause_flags() & op != 0`. `set_paused(caller, true)` writes `PAUSE_ALL`; `set_paused(caller, false)` clears all flags. `set_pause_flags(caller, flags)` writes an exact subset and rejects unknown bits. A legacy `Paused` value of `true` with no stored `PauseFlags` is interpreted as `PAUSE_ALL`.
+
+Admin rotation, pause control, fee configuration, role management, upgrades, sweep, freeze control, dispute resolution, panel voting, emergency withdrawal, storage migration, TTL extension, and compaction are intentionally **not** pause-gated. They remain available as recovery or maintenance actions. `execute_upgrade` and admin rotation are explicitly allowed while paused.
+
+For gated party flows the pause check runs before `require_auth()`. `void_rating` is the exception: it authenticates the admin first and then checks `PAUSE_REPUTATION`.
+
+### 2.2 Per-escrow freeze
+
+`freeze_escrow(id, reason)` sets `DataKey::Frozen(id)`. `unfreeze_escrow(id)` clears it. When an entrypoint marked **Blocked** below calls `require_not_frozen(id)`, the call fails with `EscrowFrozen` before authentication and before any token movement.
+
+Freeze is limited to party-initiated escrow mutations. Administrative recovery (`emergency_withdraw`), dispute resolution (`resolve_dispute` and `vote_resolution`), rating voiding, and maintenance operations deliberately do not check the frozen flag. `compact_escrow` is permissionless but does check it.
+
+---
+
+## 3. Complete state-changing authorization matrix
+
+Every mutating public entrypoint in `contracts/escrow/src/lib.rs` appears below. `Source` in the signer column means the address is read from stored state rather than supplied as an argument.
+
+| Entrypoint | Required `require_auth` subject | Role | Pause category | Freeze behavior | Key preconditions |
+|------------|--------------------------------|------|----------------|-----------------|-------------------|
+| `initialize(admin)` | `admin` argument | Admin | None | N/A | Admin slot must be empty; initializes admin, pause state, and id counter |
+| `propose_admin(new_admin)` | Stored admin | Admin | None | N/A | Contract initialized; `new_admin` must differ from current admin; overwrites any pending nominee |
+| `accept_admin()` | Pending nominee from storage | Pending admin | None | N/A | A pending nomination must exist; no timelock in contract code |
+| `cancel_admin_proposal()` | Stored admin | Admin | None | N/A | A pending nomination must exist |
+| `set_paused(caller, paused)` | `caller` argument | Admin or Pauser | None; writes the gate | N/A | `caller` must hold `Pauser` or be admin; `true` writes `PAUSE_ALL`, `false` clears flags |
+| `set_pause_flags(caller, flags)` | `caller` argument | Admin or Pauser | None; writes the gate | N/A | Same role gate; `flags & !PAUSE_ALL` must be zero; starts or clears the emergency-exit clock |
+| `set_fee(fee_bps, treasury)` | Stored admin | Admin | None | N/A | `fee_bps <= MAX_FEE_BPS` (500); treasury must not be this contract |
+| `emergency_withdraw(id, caller)` | `caller` argument | Party | None; requires an active pause | Allowed while frozen | Caller must be stored client or freelancer; pause must have been continuous for at least 30 days; status must be `Created`, `Funded`, or `Disputed` |
+| `sweep_surplus(token, to)` | Stored admin | Admin | None | N/A | Token balance must exceed aggregate liability |
+| `set_payout_address(id, payout)` | Stored freelancer | Party | `PAUSE_CREATE` | Blocked | Status `Created` or `Funded`; payout must not be the contract or client |
+| `freeze_escrow(id, reason)` | Stored admin | Admin | None | N/A | Escrow must exist and not already be frozen |
+| `unfreeze_escrow(id)` | Stored admin | Admin | None | N/A | Escrow must exist and currently be frozen |
+| `create_contract(client, freelancer, token, amounts)` | `client` argument | Party (client) | `PAUSE_CREATE` | N/A | Admin initialized; parties distinct and not the contract or admin; 1..=20 valid milestone amounts |
+| `create_contract_with_review(client, freelancer, token, amounts, window)` | `client` argument | Party (client) | `PAUSE_CREATE` | N/A | Same creation checks; review window within 1 hour..=30 days |
+| `create_and_fund(client, freelancer, token, amounts)` | `client` argument | Party (client) | `PAUSE_CREATE` and `PAUSE_DEPOSIT` | N/A | Same creation checks; client transfers the full total in the same call |
+| `create_contract_sequential(client, freelancer, token, amounts)` | `client` argument | Party (client) | `PAUSE_CREATE` | N/A | Same creation checks; marks the escrow as strictly ordered |
+| `create_stream(client, freelancer, token, amount, start, end)` | `client` argument | Party (client) | `PAUSE_CREATE` | N/A | Same creation checks; `start < end` and duration at least 1 hour |
+| `set_team_split(id, payees)` | Stored freelancer | Party (freelancer) | `PAUSE_CREATE` | Blocked | Status `Created`, zero funded; 1..=5 unique payees, nonzero bps summing to 10,000 |
+| `deposit_funds(id, amount)` | Stored client | Party (client) | `PAUSE_DEPOSIT` | Blocked | Status `Created`; funding deadline not passed; amount positive and does not overfund |
+| `deposit_from(id, funder, amount)` | `funder` argument | Anyone (funder signs) | `PAUSE_DEPOSIT` | Blocked | Same deposit checks; at most 10 distinct funders per escrow |
+| `submit_milestone(id, index)` | Stored freelancer | Party (freelancer) | `PAUSE_RELEASE` | Blocked | Non-stream escrow, status `Funded`; milestone unreleased and its remaining amount is covered |
+| `claim_milestone(id, index)` | Stored freelancer | Party (freelancer) | `PAUSE_RELEASE` | Blocked | Non-stream escrow; milestone was submitted and review window elapsed; status `Funded` or `Cancelled` |
+| `release_milestone(id, index)` | Stored client | Party (client) | `PAUSE_RELEASE` | Blocked | Non-stream escrow, status `Created` or `Funded`; milestone unreleased; held funds cover it; sequential order respected |
+| `release_partial(id, index, amount)` | Stored client | Party (client) | `PAUSE_RELEASE` | Blocked | Same release checks; `0 < amount <= remaining` on the milestone |
+| `release_milestones(id, indices)` | Stored client | Party (client) | `PAUSE_RELEASE` | Blocked | Same release checks; 1..=20 unique indices; held funds cover the batch; sequential order respected |
+| `pay_bonus(id, amount)` | Stored client | Party (client) | `PAUSE_RELEASE` | Blocked | Status `Funded` or `Completed`; amount positive; direct client-to-payee transfer |
+| `withdraw_vested(id)` | Stored freelancer | Party (freelancer) | `PAUSE_RELEASE` | Blocked | Stream escrow, status `Funded`, not stopped; newly vested amount is positive |
+| `stop_stream(id)` | Stored client | Party (client) | `PAUSE_CANCEL` | Blocked | Stream escrow, status `Funded`, not already stopped |
+| `open_dispute(id, caller)` | `caller` argument | Party | `PAUSE_DISPUTE` | Blocked | Caller is stored client or freelancer; status `Created` or `Funded`; caller transfers the dispute bond |
+| `resolve_dispute(caller, id, bps, bond_to_opener)` | `caller` argument | Admin or Resolver | None | Allowed while frozen | Caller holds `Resolver` or is admin and is not a party; status `Disputed`; total below panel threshold; `bps <= 10,000` |
+| `set_panel(members, threshold)` | Stored admin | Admin | None | N/A | `1 <= threshold <= members.len() <= 7`; no duplicate members |
+| `vote_resolution(member, id, bps)` | `member` argument | Panel member | None | Allowed while frozen | Status `Disputed`; member is on the current panel and not a party; `bps <= 10,000`; matching votes reach threshold to settle |
+| `propose_change_order(id, amounts)` | Stored client | Party (client) | `PAUSE_CREATE` | Blocked | Status `Created`, `Funded`, or `Completed`; added milestones fit `MAX_MILESTONES` and amount limits |
+| `accept_change_order(id)` | Stored freelancer | Party (freelancer) | `PAUSE_CREATE` | Blocked | Pending change order exists; status allows acceptance; reopens escrow as `Created` |
+| `reject_change_order(id)` | Stored freelancer | Party (freelancer) | None | Allowed while frozen | Pending change order exists |
+| `set_terms(id, hash, specs)` | Stored client | Party (client) | `PAUSE_CREATE` | Blocked | Status `Created`, zero funded; zero or one spec hash per milestone |
+| `deliver(id, index, hash)` | Stored freelancer | Party (freelancer) | `PAUSE_RELEASE` | Blocked | Status `Created`, `Funded`, or `Disputed`; milestone not released |
+| `expire_unfunded(id)` | None | Anyone | `PAUSE_CANCEL` | Blocked | Status `Created`, zero released; funding deadline passed; partial funds refunded to recorded funders |
+| `propose_settlement(id, proposer, freelancer_amount)` | `proposer` argument | Party | `PAUSE_CANCEL` | Blocked | Proposer is stored client or freelancer; status `Created`, `Funded`, or `Disputed`; amount within held balance |
+| `accept_settlement(id, acceptor, freelancer_amount)` | `acceptor` argument | Party | `PAUSE_CANCEL` | Blocked | Acceptor is the other party; proposal exists and amount matches; status allows settlement |
+| `withdraw_settlement(id, proposer)` | `proposer` argument | Party (original proposer) | None | Allowed while frozen | Proposal exists and its stored proposer equals the signer |
+| `propose_amendment(id, proposer, amounts)` | `proposer` argument | Party | `PAUSE_CREATE` | Blocked | Non-stream escrow, status `Created` or `Funded`; proposer is a party; same milestone count, valid amounts, released amounts unchanged |
+| `accept_amendment(id, acceptor, nonce)` | `acceptor` argument | Party | `PAUSE_CREATE` | Blocked | Acceptor is a party and not the proposer; nonce matches pending amendment; status allows amendment; revalidated against current state |
+| `resign(id)` | Stored freelancer | Party (freelancer) | `PAUSE_CANCEL` | Blocked | Status `Created` or `Funded`; unreleased funds refunded to funders |
+| `cancel_contract(id)` | Stored client | Party (client) | `PAUSE_CANCEL` | Blocked | Non-stream escrow, status `Created` or `Funded`; submitted milestone backing stays claimable |
+| `propose_party_migration(id, party, new_address)` | `party` argument | Party (the address being replaced) | `PAUSE_CREATE` | Blocked | `party` is the stored client or freelancer; status `Created` or `Funded`; nominee is not the contract, the admin (`AdminCannotBeParty`), a current party or the client's payout address (`InvalidParties`); no nomination pending for the other party |
+| `accept_party_migration(id)` | Pending nominee from storage | Nominee | `PAUSE_CREATE` | Blocked | A nomination exists; status `Created` or `Funded`; the proposing address still holds its role |
+| `cancel_party_migration(id)` | Pending proposer from storage | Party (proposer) | `PAUSE_CREATE` | Blocked | A nomination exists |
+| `issue_reputation(id, rating)` | Stored client | Party (client) | `PAUSE_REPUTATION` | Blocked | Status `Completed` or `Resolved`; not compacted; not already issued; rating 1..=5; released value at least `MIN_REPUTATION_VALUE` |
+| `rate_client(id, rating)` | Stored freelancer | Party (freelancer) | `PAUSE_REPUTATION` | Blocked | Status `Completed` or `Resolved`; not already rated; rating 1..=5 |
+| `void_rating(id, reason)` | Stored admin | Admin | `PAUSE_REPUTATION` | Allowed while frozen | Rating record exists and is not already voided; authentication precedes the pause check |
+| `migrate_escrows(ids)` | None | Anyone | None | Allowed while frozen | At most 50 ids; already-migrated and unknown ids are skipped |
+| `extend_escrow_ttl(id)` | None | Anyone | None | Allowed while frozen | Escrow or compact receipt must exist; caller pays rent extension |
+| `extend_reputation_ttl(freelancer)` | None | Anyone | None | N/A | No authorization or existence precondition |
+| `compact_escrow(id)` | None | Anyone | None | Blocked | Not already compacted; terminal status; `Cancelled` fully refunded or `Completed`/`Resolved` rated or past grace period |
+| `grant_role(role, account)` | Stored admin | Admin | None | N/A | Admin initialized; membership must actually change, otherwise `RoleUnchanged` |
+| `revoke_role(role, account)` | Stored admin | Admin | None | N/A | Admin initialized; membership must actually change, otherwise `RoleUnchanged` |
+| `schedule_upgrade(hash)` | Stored admin | Admin | None | N/A | Admin initialized; stores hash with a 48-hour eta and restarts the delay on resubmission |
+| `cancel_upgrade()` | Stored admin | Admin | None | N/A | A pending upgrade must exist |
+| `execute_upgrade()` | Stored admin | Admin | None; allowed while paused | N/A | Pending upgrade exists and eta has elapsed; clears the pending record before installing WASM |
+
+---
+
+### 3.1 Two-step party address migration
+
+`propose_party_migration(id, party, new_address)`, `accept_party_migration(id)` and `cancel_party_migration(id)` let a client or freelancer move an escrow to a new address without the counterparty re-creating it.
+
+**Flow.**
+
+1. The current party calls `propose_party_migration` with its own address as `party` and the replacement as `new_address`. `party.require_auth()` is the only signature needed. Soroban does not expose the invoker, so the party is passed explicitly and validated against `EscrowContract.client` / `EscrowContract.freelancer`, the same pattern as `open_dispute(id, caller)`.
+2. The nomination is stored under `DataKey::PartyMigration(id)` as `PartyMigration { role, current, nominee }` and is readable with `get_party_migration(id)`.
+3. The nominee calls `accept_party_migration(id)` and authorizes with `nominee.require_auth()`. Only that address can complete the migration.
+4. Either step can be cancelled by the proposing party with `cancel_party_migration(id)`, which authorizes `PartyMigration.current`. The counterparty and the nominee cannot cancel someone else's nomination, and the admin has no override.
+
+**Invalid targets.** `new_address` may not be the contract itself, either current party (so the counterparty's address is rejected), or the escrow's payout address when the client is migrating (`InvalidParties`), and may not be the admin (`AdminCannotBeParty`).
+
+**Gates.** All three entrypoints check `PAUSE_CREATE` and `require_not_frozen(id)`, and only run while the escrow is `Created` or `Funded`. A disputed escrow, or one that is already completed, resolved or cancelled, returns `InvalidStatus`; a frozen escrow returns `EscrowFrozen`. A nomination that is pending for the other party returns `InvalidStatus`; re-proposing from the same party replaces its own nomination.
+
+**On acceptance** the stored party address is replaced, the escrow id is appended to the nominee's party index (`ClientEscrows` / `FreelancerEscrows` and its paged entries), funder contributions recorded for the old address are merged onto the new one, a payout address that pointed at the old freelancer follows the nominee, team split payees are re-pointed (merging shares if the nominee was already a payee), and any pending settlement proposed by the old address is dropped. The nominee can then act with the full authority of the role and the old address fails every party check with `Unauthorized`.
+
+**Index behaviour.** The party index is append-only, so the old address' entry is left in place: it keeps counting toward that address' page count, but `get_client_escrows` / `get_freelancer_escrows` verify that the queried address is still the escrow's current client or freelancer and skip entries that are no longer active. Pagination therefore stays over the raw index — a stale entry is filtered out of the page it falls on rather than being replaced by a later id. Escrows that have been compacted into a receipt cannot be loaded, so their index entries are kept: the receipt still records the parties and the entry cannot be shown to be stale.
+
+**Events.** `("pmig_prop", id) -> (role, current, nominee)` on proposal, `("pmigrate", id) -> (role, old, new)` on acceptance, and `("pmig_cncl", id) -> (role, current)` on cancellation.
+
+---
+
+## 4. Authorization invariants
+
+These properties are enforced by the code paths in the matrix above.
+
+1. **No unauthenticated value transfer from a party account.** Every entrypoint that debits a client, freelancer, funder, or dispute opener calls `require_auth()` on that exact stored or validated address.
+2. **Stored identity outranks argument identity.** Client-only and freelancer-only entrypoints authorize `contract.client` or `contract.freelancer` from storage. Argument-based entrypoints (`deposit_from`, `open_dispute`, settlement, amendment, panel voting) authorize the argument and then check it against the required role.
+3. **Admin authority is explicit and narrow.** `require_admin` reads `DataKey::Admin`; `holds_role` gives the admin implicit `Pauser` and `Resolver` membership. A `Pauser` cannot resolve, and a `Resolver` cannot pause.
+4. **Dispute resolution is conflict-free.** `resolve_dispute` rejects the client and freelancer even if they hold `Resolver`, and high-value escrows require a panel vote instead of a single resolver call.
+5. **Pause is category-specific.** A `PAUSE_CREATE` flag blocks creation and setup but not cancellation; `PAUSE_REPUTATION` blocks ratings and voiding; `PAUSE_ALL` blocks all six categories. Recovery and governance actions are deliberately exempt.
+6. **Freeze is escrow-local and party-facing.** Frozen escrows reject party mutations with `EscrowFrozen` but remain resolvable, emergency-exitable, migratable, TTL-extendable, and voidable by admin governance.
+7. **Permissionless entrypoints are predicate-bound.** `expire_unfunded`, `migrate_escrows`, `extend_escrow_ttl`, `extend_reputation_ttl`, and `compact_escrow` require no signature, but each is limited by status, deadline, batch size, existence, or receipt rules.
+8. **No hidden timelock.** Admin rotation is two-step but does not enforce a delay in this contract. The 48-hour delay applies only to `execute_upgrade`, and the 30-day delay applies only to `emergency_withdraw`.
+
+---
+
+## 5. Test cross-checks
+
+The MockAuth tests in `contracts/escrow/src/test.rs` verify the signer column rather than merely relying on comments.
+
+| Test | What it verifies |
+|------|------------------|
+| `client_cannot_deliver_and_freelancer_cannot_set_terms` | `deliver` requires freelancer auth; `set_terms` requires client auth. Authorizing the wrong party fails for both. |
+| `bonus_requires_client_auth` | `pay_bonus` requires client auth; freelancer auth alone fails and no bonus is recorded. |
+| `client_cannot_set_payout_address` | `set_payout_address` requires freelancer auth; client auth alone fails. |
+| `submit_milestone_failure_paths` and `claim_milestone_failure_paths` | Client auth cannot substitute for freelancer auth, and `PAUSE_RELEASE` blocks both. |
+| `test_rate_client_authorization` | `rate_client` accepts only freelancer auth; client and third-party auth fail. |
+| `client_calling_resign_rejected` | `resign` requires freelancer auth; client auth fails. |
+| `stream_auth_schedule_and_milestone_api_guards` | `withdraw_vested` requires freelancer auth; client auth fails. |
+| `pauser_can_pause_but_cannot_resolve_disputes` and `resolver_can_resolve_but_cannot_pause` | `Pauser` and `Resolver` are distinct; admin holds both implicitly. |
+| `grant_and_revoke_role_unchanged_and_admin_only` | Role grants and revocations require admin auth. |
+| `propose_rejects_self_and_non_admin` and `accept_by_non_nominee_fails` | Admin rotation signers are the stored admin for propose and the pending nominee for accept. |
+| `admin_transfer_works_while_paused` | Admin rotation is exempt from the pause gate. |
+| `test_non_admin_freeze_rejected` and `test_freeze_error_conditions` | Freeze and unfreeze require the stored admin. |
+| `test_per_escrow_freeze_isolation_and_unfreeze` | Freeze blocks client and freelancer mutations but is isolated per escrow and reversible by admin. |
+| `test_resolve_dispute_allowed_on_frozen_escrow` | Resolution remains available on a frozen escrow. |
+| `each_pause_flag_gates_exactly_its_entry_points` | Each pause bit gates only its own category. |
+| `inflow_pause_still_lets_clients_cancel_and_refund` | Create and deposit can be paused while cancellation remains available. |
+| `vote_change_replaces_vote_and_requires_membership` | Non-members and parties cannot vote; only current panel votes count. |
+| `only_current_party_can_propose_migration` and `only_nominee_can_accept_migration` | `propose_party_migration` rejects a non-party signer with `Unauthorized`; `accept_party_migration` rejects every address except the stored nominee. |
+| `unauthorized_caller_cannot_cancel_migration` | The counterparty and the nominee cannot cancel a pending nomination. |
+| `migration_blocked_while_disputed`, `migration_blocked_while_frozen` and `migration_respects_pause_flags` | `InvalidStatus` while disputed, `EscrowFrozen` while frozen, `Paused` under `PAUSE_CREATE`. |
+| `old_freelancer_cannot_act_after_migration` and `migrated_client_acts_and_old_client_is_rejected` | After acceptance the old address can no longer authorize party actions. |
+| `migration_appends_new_party_index_and_filters_old_party` | The nominee is indexed and the old address' stale entry is filtered out of index queries. |
+| `test_partial_deposit_refund_third_party` | `expire_unfunded` is permissionless and refunds funders rather than the caller. |
+
+---
+
+## 6. Related documents
+
+| Topic | Document |
+|-------|----------|
+| Role and storage layout | `docs/escrow/access-control.md`, `docs/escrow/authorization-storage.md` |
+| Full ABI surface | `docs/escrow/abi-reference.md` |
+| Dispute resolution flow | `docs/escrow/dispute-resolution.md` |
+| Emergency exit rules | `docs/escrow/emergency-controls.md` |
+| Protocol fee rules | `docs/escrow/protocol-fees.md` |
+| Storage and TTL model | `docs/escrow/state-persistence.md`, `docs/escrow/storage-ttl.md` |
+| Security analysis | `docs/escrow/SECURITY.md` |
